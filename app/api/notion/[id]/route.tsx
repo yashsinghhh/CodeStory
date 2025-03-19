@@ -13,8 +13,8 @@ const notion = new Client({
   auth: process.env.NOTION_API_KEY
 });
 
-// Cache expiration (1 hour)
-const CACHE_EXPIRATION = 3600; // seconds
+// Cache expiration (1 week)
+const CACHE_EXPIRATION = 7 * 24 * 60 * 60; // seconds in a week
 
 // Define a type for processed blocks
 type ProcessedBlock = {
@@ -72,18 +72,16 @@ function extractBlockContent(block: BlockObjectResponse): string {
   }
 }
 
-// Batch fetch and process blocks with depth limitation
+// Batch fetch and process blocks
 async function processBlocks(
   pageId: string, 
   maxDepth: number = 3
 ): Promise<ProcessedBlock[]> {
-  // Fetch initial blocks
   const initialBlocksResponse = await notion.blocks.children.list({
     block_id: pageId,
-    page_size: 100, // Notion's max page size
+    page_size: 100,
   });
 
-  // Recursive processing function
   const processBlocksRecursive = async (
     blocks: BlockObjectResponse[], 
     currentDepth: number
@@ -91,7 +89,6 @@ async function processBlocks(
     const processedBlocks: ProcessedBlock[] = [];
 
     for (const block of blocks) {
-      // Extract content based on block type
       const content = extractBlockContent(block);
 
       if (content && currentDepth > 0) {
@@ -100,15 +97,13 @@ async function processBlocks(
           content 
         };
 
-        // Fetch and process children if depth allows
         if (block.has_children && currentDepth > 1) {
           try {
             const childBlocksResponse = await notion.blocks.children.list({
               block_id: block.id,
-              page_size: 100 // Fetch all child blocks
+              page_size: 100
             });
 
-            // Recursively process children with reduced depth
             processedBlock.children = await processBlocksRecursive(
               childBlocksResponse.results as BlockObjectResponse[], 
               currentDepth - 1
@@ -125,7 +120,6 @@ async function processBlocks(
     return processedBlocks;
   };
 
-  // Start processing with maximum depth
   return processBlocksRecursive(
     initialBlocksResponse.results as BlockObjectResponse[], 
     maxDepth
@@ -134,7 +128,7 @@ async function processBlocks(
 
 // Generate a cache key for a specific page
 function getPageCacheKey(pageId: string): string {
-  return `notion_page:${pageId}`;
+  return `notion_page_detail:${pageId}`;
 }
 
 // Retrieve cached page
@@ -157,7 +151,7 @@ async function cachePage(pageId: string, pageData: any): Promise<void> {
       'EX', 
       CACHE_EXPIRATION
     );
-    console.log(`Cached page ${pageId}`);
+    console.log(`Cached page ${pageId} for 1 week`);
   } catch (error) {
     console.error('Redis cache setting error:', error);
   }
@@ -182,8 +176,12 @@ export async function GET(
     // First, check Redis cache
     const cachedPage = await getCachedPage(pageId);
     if (cachedPage) {
-      console.log('Returning cached Notion page');
+      console.log(`🚀 Returning CACHED Notion page for ID: ${pageId}`);
+      console.log(`   Cached at: ${new Date().toISOString()}`);
+      console.log(`   Page Title: ${cachedPage['Pages '] || 'Untitled'}`);
       return NextResponse.json(cachedPage);
+    } else {
+      console.log(`🌐 Fetching Notion page from API for ID: ${pageId}`);
     }
 
     // Fetch page from Notion if not in cache
@@ -208,7 +206,7 @@ export async function GET(
       blocks: blockContents
     };
 
-    // Cache the page data
+    // Cache the page data for 1 week
     await cachePage(pageId, pageData);
 
     const processingTime = Date.now() - startTime;
