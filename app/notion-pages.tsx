@@ -14,10 +14,6 @@ export interface NotionPage {
     avatar_url: string;
   }>;
   Date: string;
-  content?: {
-    blocks: string[];
-    fullText: string;
-  };
 }
 
 export default function NotionPages() {
