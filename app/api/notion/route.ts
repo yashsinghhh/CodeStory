@@ -218,8 +218,8 @@ export async function GET(request: NextRequest) {
       database_id: databaseId,
     });
 
-    // Transform Notion response to a more readable JSON format
-    const transformedResults = await Promise.all(response.results.map(async (page: any) => {
+    // Transform Notion response to metadata-only JSON format
+    const transformedResults = response.results.map((page: any) => {
       // Extract properties
       const properties: Record<string, any> = {};
 
@@ -258,55 +258,13 @@ export async function GET(request: NextRequest) {
       // Extract page title
       const pageTitle = extractPageTitle(properties);
 
-      // Fetch full page content
-      let pageContent = null;
-      try {
-        const [pageDetails, blocksResponse] = await Promise.all([
-          notion.pages.retrieve({ page_id: page.id }),
-          notion.blocks.children.list({
-            block_id: page.id,
-            page_size: 100
-          })
-        ]);
-
-        // Process blocks
-        const blockContentsPromises = blocksResponse.results
-          .map(block => extractBlockContent(block as BlockObjectResponse));
-        
-        const blockContents = (await Promise.all(blockContentsPromises))
-          .filter(content => content !== null && 
-            (typeof content.content === 'string' ? 
-              content.content.trim() !== '' : true));
-        
-        // Generate a simple fullText for search purposes
-        const extractFullText = (blocks: any[]): string => {
-          return blocks.map(block => {
-            if (block.type === 'toggle' && block.children) {
-              return block.content + '\n' + extractFullText(block.children);
-            }
-            if ((block.type === 'numbered_list_item' || block.type === 'bulleted_list_item') && block.children) {
-              return block.content + '\n' + extractFullText(block.children);
-            }
-            return block.content;
-          }).join('\n');
-        };
-
-        pageContent = {
-          blocks: blockContents,
-          fullText: extractFullText(blockContents)
-        };
-      } catch (contentError) {
-        console.error(`Error fetching content for page ${page.id}:`, contentError);
-      }
-
       return {
         id: page.id,
         url: page.url,
         pageTitle, // Use the extracted page title
-        ...properties,
-        content: pageContent
+        ...properties
       };
-    }));
+    });
 
     // Always update the cache
     await cacheNotionPages(transformedResults);

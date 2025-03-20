@@ -1,10 +1,10 @@
-import { Client } from "@notionhq/client";
 import { UserButton } from "@clerk/nextjs";
 import Image from "next/image";
 import Link from "next/link";
 import { PageObjectResponse, BlockObjectResponse } from "@notionhq/client/build/src/api-endpoints";
 import PageActions from './page-actions';
 import NotionBlockRenderer from "../../components/NotionBlockRenderer";
+import redisClient from '@/lib/redis';
 
 // Define a more flexible interface for page details
 interface NotionPageDetails {
@@ -18,10 +18,116 @@ interface NotionPageDetails {
   [key: string]: any; // Allow additional dynamic properties
 }
 
-// Initialize Notion client
-const notion = new Client({
-  auth: process.env.NOTION_API_KEY,
-});
+// Generate a cache key for a specific page
+function getPageCacheKey(pageId: string): string {
+  return `notion_page_detail:${pageId}`;
+}
+
+// Retrieve cached page
+async function getCachedPage(pageId: string): Promise<any | null> {
+  try {
+    const cachedData = await redisClient.get(getPageCacheKey(pageId));
+    return cachedData ? JSON.parse(cachedData) : null;
+  } catch (error) {
+    console.error('Redis cache retrieval error:', error);
+    return null;
+  }
+}
+
+// Cache page data
+async function cachePage(pageId: string, pageData: any, expiration: number = 3600): Promise<void> {
+  try {
+    await redisClient.set(
+      getPageCacheKey(pageId), 
+      JSON.stringify(pageData), 
+      'EX', 
+      expiration
+    );
+    console.log(`Cached page ${pageId} for ${expiration} seconds`);
+  } catch (error) {
+    console.error('Redis cache setting error:', error);
+  }
+}
+
+// Fetch Notion Page Details (Helper Function)
+async function fetchNotionPage(id: string): Promise<NotionPageDetails | null> {
+  const startTime = Date.now();
+  
+  try {
+    // First check Redis cache
+    const cachedPage = await getCachedPage(id);
+    if (cachedPage) {
+      console.log(`🚀 Using CACHED Notion page for ID: ${id}`);
+      console.log(`   Cache hit at: ${new Date().toISOString()}`);
+      console.log(`   Page Title: ${cachedPage['Pages '] || cachedPage.pageTitle || 'Untitled'}`);
+      return cachedPage;
+    }
+    
+    console.log(`🌐 Cache miss - fetching from API for page ID: ${id}`);
+    
+    // If not in cache, fetch from API
+    const apiUrl = `/api/notion/${id}`;
+    const response = await fetch(apiUrl);
+    
+    if (!response.ok) {
+      throw new Error(`API returned status: ${response.status}`);
+    }
+    
+    const pageData = await response.json();
+    
+    // Store in Redis cache
+    await cachePage(id, pageData);
+    
+    const processingTime = Date.now() - startTime;
+    console.log(`Page processed in ${processingTime}ms`);
+    
+    return pageData;
+  } catch (error) {
+    console.error("Error fetching Notion page:", error);
+    
+    // Fallback to direct API call if the API route fails
+    try {
+      console.log("Attempting direct API fallback...");
+      // Import the API client only if needed (to avoid server/client mismatch issues)
+      const { Client } = await import("@notionhq/client");
+      const notion = new Client({
+        auth: process.env.NOTION_API_KEY,
+      });
+      
+      // Type assertion to ensure we're working with a full page response
+      const pageResponse = await notion.pages.retrieve({
+        page_id: id
+      }) as PageObjectResponse;
+
+      // Extract properties dynamically
+      const properties: Record<string, any> = {};
+      Object.entries(pageResponse.properties).forEach(([key, prop]: [string, any]) => {
+        properties[key] = extractPropertyValue(prop);
+      });
+
+      // Process all blocks starting at the page level
+      const blockContents = await processBlocks(id, notion);
+      
+      const result = {
+        id: pageResponse.id,
+        url: pageResponse.url,
+        ...properties,
+        blocks: blockContents,
+      };
+      
+      // Cache the result
+      await cachePage(id, result);
+      
+      const processingTime = Date.now() - startTime;
+      console.log(`Fallback page processed in ${processingTime}ms`);
+      
+      return result;
+    } catch (fallbackError) {
+      console.error("Fallback also failed:", fallbackError);
+      return null;
+    }
+  }
+}
 
 // Helper function to extract property value
 function extractPropertyValue(property: any): any {
@@ -50,155 +156,157 @@ function extractRichTextContent(richTexts: any[]): string {
   return richTexts.map((text: any) => text.plain_text || '').join('').trim();
 }
 
-// Recursive function to process blocks including toggles
-async function processBlocks(blockId: string): Promise<any[]> {
-  const blocksResponse = await notion.blocks.children.list({
-    block_id: blockId,
-    page_size: 100,
-  });
-  
-  const processedBlocks = [];
-  
-  for (const block of blocksResponse.results as BlockObjectResponse[]) {
-    let processedBlock = null;
-    
-    switch (block.type) {
-      case "paragraph": {
-        if ('paragraph' in block) {
-          const content = extractRichTextContent(block.paragraph.rich_text);
-          if (content) {
-            processedBlock = { type: "paragraph", content };
-          }
-        }
-        break;
-      }
-      case "heading_1": {
-        if ('heading_1' in block) {
-          const content = extractRichTextContent(block.heading_1.rich_text);
-          if (content) {
-            processedBlock = { type: "heading_1", content };
-          }
-        }
-        break;
-      }
-      case "heading_2": {
-        if ('heading_2' in block) {
-          const content = extractRichTextContent(block.heading_2.rich_text);
-          if (content) {
-            processedBlock = { type: "heading_2", content };
-          }
-        }
-        break;
-      }
-      case "heading_3": {
-        if ('heading_3' in block) {
-          const content = extractRichTextContent(block.heading_3.rich_text);
-          if (content) {
-            processedBlock = { type: "heading_3", content };
-          }
-        }
-        break;
-      }
-      case "bulleted_list_item": {
-        if ('bulleted_list_item' in block) {
-          const content = extractRichTextContent(block.bulleted_list_item.rich_text);
-          if (content) {
-            let children = [];
-            // Process children if they exist
-            if (block.has_children) {
-              children = await processBlocks(block.id);
-            }
-            
-            processedBlock = { 
-              type: "bulleted_list_item", 
-              content,
-              ...(children.length > 0 ? { children } : {})
-            };
-          }
-        }
-        break;
-      }
-      case "numbered_list_item": {
-        if ('numbered_list_item' in block) {
-          const content = extractRichTextContent(block.numbered_list_item.rich_text);
-          if (content) {
-            let children = [];
-            // Process children if they exist
-            if (block.has_children) {
-              children = await processBlocks(block.id);
-            }
-            
-            processedBlock = { 
-              type: "numbered_list_item", 
-              content,
-              ...(children.length > 0 ? { children } : {})
-            };
-          }
-        }
-        break;
-      }
-      case "toggle": {
-        if ('toggle' in block) {
-          const headerContent = extractRichTextContent(block.toggle.rich_text);
-          if (headerContent) {
-            // Recursively process children if toggle has children
-            let children = [];
-            if (block.has_children) {
-              children = await processBlocks(block.id);
-            }
-            
-            processedBlock = { 
-              type: "toggle", 
-              content: headerContent,
-              children: children
-            };
-          }
-        }
-        break;
-      }
-      // Add other block types as needed
-    }
-    
-    if (processedBlock) {
-      processedBlocks.push(processedBlock);
-    }
+// Helper to batch array into chunks
+function chunkArray<T>(array: T[], size: number): T[][] {
+  const result = [];
+  for (let i = 0; i < array.length; i += size) {
+    result.push(array.slice(i, i + size));
   }
-  
-  return processedBlocks;
+  return result;
 }
 
-// Fetch Notion Page Details (Helper Function)
-async function fetchNotionPage(id: string): Promise<NotionPageDetails | null> {
-  try {
-    // Type assertion to ensure we're working with a full page response
-    const pageResponse = await notion.pages.retrieve({
-      page_id: id
-    }) as PageObjectResponse;
-
-    // Extract properties dynamically
-    const properties: Record<string, any> = {};
-    Object.entries(pageResponse.properties).forEach(([key, prop]) => {
-      properties[key] = extractPropertyValue(prop);
-    });
-
-    // Process all blocks starting at the page level
-    const blockContents = await processBlocks(id);
+// Optimized function to fetch blocks efficiently
+async function processBlocks(rootBlockId: string, notionClient: any): Promise<any[]> {
+  const timeId = Date.now();
+  const processBlocksLabel = `processBlocks_${timeId}`;
+  console.time(processBlocksLabel);
+  
+  // Step 1: Prepare data structures
+  const blocksMap = new Map<string, any>(); // Maps block IDs to their content
+  const childrenMap = new Map<string, any[]>(); // Maps parent block IDs to arrays of their children
+  const blocksToFetch = [rootBlockId]; // Queue of block IDs to fetch
+  
+  // Step 2: Breadth-first fetch of all blocks (maximum of 3 levels deep)
+  let depth = 0;
+  const MAX_DEPTH = 2; // You can adjust this based on your needs
+  const BATCH_SIZE = 10; // Increased batch size for better parallelization
+  
+  while (blocksToFetch.length > 0 && depth <= MAX_DEPTH) {
+    console.log(`Processing depth ${depth}, blocks to fetch: ${blocksToFetch.length}`);
     
-    return {
-      id: pageResponse.id,
-      url: pageResponse.url,
-      ...properties,
-      blocks: blockContents,
-    };
-  } catch (error) {
-    console.error("Error fetching Notion page:", error);
-    return null;
+    // Process in batches to parallelize API calls
+    const batches = chunkArray(blocksToFetch, BATCH_SIZE);
+    const nextLevelBlocks: string[] = []; // Store the next level's blocks here 
+    
+    // Process each batch in parallel
+    for (const batch of batches) {
+      const batchResults = await Promise.all(
+        batch.map(blockId => notionClient.blocks.children.list({
+          block_id: blockId,
+          page_size: 100
+        }))
+      );
+      
+      // Process results for this batch
+      batch.forEach((parentId, index) => {
+        const results = batchResults[index].results as BlockObjectResponse[];
+        
+        // Store each block and collect IDs of blocks with children
+        for (const block of results) {
+          // Store the block content
+          blocksMap.set(block.id, block);
+          
+          // If block has children and we're not at max depth, add to queue for next depth
+          if (block.has_children && depth < MAX_DEPTH) {
+            nextLevelBlocks.push(block.id);
+          }
+        }
+        
+        // Store parent-children relationship
+        childrenMap.set(parentId, results);
+      });
+      
+      // Add a small delay to avoid rate limiting if we have many batches
+      if (batches.length > 3) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+    }
+    
+    // Update blocks to fetch for next iteration
+    blocksToFetch.length = 0;
+    blocksToFetch.push(...nextLevelBlocks);
+    
+    // Increase depth for next iteration
+    depth++;
   }
+  
+  console.log(`Fetched blocks for ${blocksMap.size} blocks across ${depth} levels`);
+  
+  // Step 3: Process the top-level blocks and build the hierarchy
+  const topLevelBlocks = childrenMap.get(rootBlockId) || [];
+  
+  // Transform blocks into the expected format
+  const processedTopLevel = topLevelBlocks.map((block: BlockObjectResponse) => {
+    return processBlockWithChildren(block, childrenMap);
+  });
+  
+  console.timeEnd(processBlocksLabel);
+  return processedTopLevel;
+}
+
+// Helper function to process a block and its children
+function processBlockWithChildren(block: BlockObjectResponse, childrenMap: Map<string, BlockObjectResponse[]>): any {
+  // Extract content based on block type
+  let processedBlock: any = {
+    type: block.type,
+    content: ''
+  };
+  
+  // Extract content based on block type
+  switch(block.type) {
+    case "paragraph":
+      if ('paragraph' in block) {
+        processedBlock.content = extractRichTextContent(block.paragraph.rich_text);
+      }
+      break;
+    case "heading_1":
+      if ('heading_1' in block) {
+        processedBlock.content = extractRichTextContent(block.heading_1.rich_text);
+      }
+      break;
+    case "heading_2":
+      if ('heading_2' in block) {
+        processedBlock.content = extractRichTextContent(block.heading_2.rich_text);
+      }
+      break;
+    case "heading_3":
+      if ('heading_3' in block) {
+        processedBlock.content = extractRichTextContent(block.heading_3.rich_text);
+      }
+      break;
+    case "bulleted_list_item":
+      if ('bulleted_list_item' in block) {
+        processedBlock.content = extractRichTextContent(block.bulleted_list_item.rich_text);
+      }
+      break;
+    case "numbered_list_item":
+      if ('numbered_list_item' in block) {
+        processedBlock.content = extractRichTextContent(block.numbered_list_item.rich_text);
+      }
+      break;
+    case "toggle":
+      if ('toggle' in block) {
+        processedBlock.content = extractRichTextContent(block.toggle.rich_text);
+      }
+      break;
+    default:
+      processedBlock.content = `Unsupported block type: ${block.type}`;
+  }
+  
+  // Add children if they exist
+  if (block.has_children && childrenMap.has(block.id)) {
+    const childBlocks = childrenMap.get(block.id) || [];
+    processedBlock.children = childBlocks.map((childBlock: BlockObjectResponse) => 
+      processBlockWithChildren(childBlock, childrenMap)
+    );
+  }
+  
+  return processedBlock;
 }
 
 export default async function NotionPageDetail({ params }: { params: { id: string } }) {
   // Validate params
-  const pageId = await params.id;
+  const pageId = params.id;
 
   if (!pageId) {
     return (
@@ -208,7 +316,7 @@ export default async function NotionPageDetail({ params }: { params: { id: strin
     );
   }
 
-  // Fetch page details
+  // Fetch page details with Redis caching
   const pageDetails = await fetchNotionPage(pageId);
 
   if (!pageDetails) {
@@ -251,12 +359,12 @@ export default async function NotionPageDetail({ params }: { params: { id: strin
         {/* Page Header */}
         <header className="mb-12 animate-fade-in-up">
           {/* Author Info */}
-          {pageDetails.people && pageDetails.people.length > 0 && (
+          {pageDetails.author && pageDetails.author.length > 0 && (
             <div className="flex items-center mb-6">
-              {pageDetails.people[0].avatar_url && (
+              {pageDetails.author[0].avatar_url && (
                 <Image
-                  src={pageDetails.people[0].avatar_url}
-                  alt={pageDetails.people[0].name}
+                  src={pageDetails.author[0].avatar_url}
+                  alt={pageDetails.author[0].name}
                   width={56}
                   height={56}
                   className="rounded-full mr-5 border-2 border-blue-100 shadow-md"
@@ -268,10 +376,10 @@ export default async function NotionPageDetail({ params }: { params: { id: strin
               )}
               <div>
                 <h1 className="text-4xl font-bold text-gray-900 mb-2 leading-tight">
-                  {pageDetails["Pages "] || "Untitled Page"}
+                  {pageDetails.pageTitle || pageDetails["Pages "] || "Untitled Page"}
                 </h1>
                 <p className="text-gray-600 text-sm">
-                  Created by {pageDetails.people?.[0]?.name || "Unknown"}{" "}
+                  Created by {pageDetails.author?.[0]?.name || "Unknown"}{" "}
                   {pageDetails.Date && `on ${pageDetails.Date}`}
                 </p>
               </div>
@@ -288,8 +396,8 @@ export default async function NotionPageDetail({ params }: { params: { id: strin
 
         {/* Page Content */}
         <article className="prose max-w-none text-gray-800 space-y-4 animate-fade-in-up delay-200">
-  <NotionBlockRenderer blocks={pageDetails.blocks} />
-</article>
+          <NotionBlockRenderer blocks={pageDetails.blocks} />
+        </article>
 
         {/* Page Actions */}
         <PageActions pageId={pageDetails.id} notionUrl={pageDetails.url} />
@@ -301,15 +409,18 @@ export default async function NotionPageDetail({ params }: { params: { id: strin
 // Generate static params for better performance
 export async function generateStaticParams() {
   try {
-    const notion = new Client({
-      auth: process.env.NOTION_API_KEY,
-    });
-
-    const response = await notion.databases.query({
-      database_id: process.env.NOTION_DATABASE_ID!,
-    });
-
-    return response.results.map((page: any) => ({
+    // Fetch all pages from the API route
+    const response = await fetch(
+      new URL('/api/notion', process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000').toString()
+    );
+    
+    if (!response.ok) {
+      throw new Error(`Failed to fetch pages: ${response.status}`);
+    }
+    
+    const pages = await response.json();
+    
+    return pages.map((page: any) => ({
       id: page.id,
     }));
   } catch (error) {

@@ -1,0 +1,15 @@
+CREATE TABLE pages (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),  -- Unique identifier for each page
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,  -- Foreign key linking to users(id)
+    notion_page_id TEXT NOT NULL UNIQUE,  -- Unique Notion page ID
+    title TEXT,  -- Title of the Notion page
+    content TEXT,  -- Extracted content from the Notion page
+    created_at TIMESTAMPTZ DEFAULT TIMEZONE('utc'::text, NOW()),  -- Timestamp when stored
+    updated_at TIMESTAMPTZ DEFAULT TIMEZONE('utc'::text, NOW())  -- Last updated timestamp
+);
+
+-- Index for efficient user-based lookups
+CREATE INDEX idx_pages_user_id ON pages(user_id);
+
+-- Index for faster searches by Notion page ID
+CREATE INDEX idx_pages_notion_page_id ON pages(notion_page_id);
