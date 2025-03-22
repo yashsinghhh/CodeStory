@@ -306,7 +306,7 @@ function processBlockWithChildren(block: BlockObjectResponse, childrenMap: Map<s
 
 export default async function NotionPageDetail({ params }: { params: { id: string } }) {
   // Validate params
-  const pageId = params.id;
+  const pageId = await params.id;
 
   if (!pageId) {
     return (
