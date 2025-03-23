@@ -305,8 +305,8 @@ function processBlockWithChildren(block: BlockObjectResponse, childrenMap: Map<s
 }
 
 export default async function NotionPageDetail({ params }: { params: { id: string } }) {
-  // Validate params
-  const pageId = await params.id;
+  // Validate params - removed await
+  const pageId = params.id;
 
   if (!pageId) {
     return (
@@ -406,25 +406,4 @@ export default async function NotionPageDetail({ params }: { params: { id: strin
   );
 }
 
-// Generate static params for better performance
-export async function generateStaticParams() {
-  try {
-    // Fetch all pages from the API route
-    const response = await fetch(
-      new URL('/api/notion', process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000').toString()
-    );
-    
-    if (!response.ok) {
-      throw new Error(`Failed to fetch pages: ${response.status}`);
-    }
-    
-    const pages = await response.json();
-    
-    return pages.map((page: any) => ({
-      id: page.id,
-    }));
-  } catch (error) {
-    console.error("Error generating static params:", error);
-    return [];
-  }
-}
+// generateStaticParams function removed

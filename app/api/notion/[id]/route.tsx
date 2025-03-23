@@ -1,130 +1,33 @@
 // app/api/notion/[id]/route.tsx
-import { Client } from '@notionhq/client';
 import { NextRequest, NextResponse } from 'next/server';
+import { supabase } from '@/lib/supabase';
 import redisClient from '@/lib/redis';
-import { 
-  BlockObjectResponse, 
-  PageObjectResponse,
-  RichTextItemResponse
-} from '@notionhq/client/build/src/api-endpoints';
+import { auth } from '@clerk/nextjs/server';
+import { syncNotionPageToSupabase } from '@/lib/notion-sync';
 
-// Initialize Notion client
-const notion = new Client({
-  auth: process.env.NOTION_API_KEY
-});
+// Helper to get internal UUID from Clerk ID
+async function getInternalUserId(clerkId: string): Promise<string | null> {
+  try {
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('id')
+      .eq('clerk_id', clerkId)
+      .single();
 
-// Cache expiration (1 week)
-const CACHE_EXPIRATION = 7 * 24 * 60 * 60; // seconds in a week
-
-// Define a type for processed blocks
-type ProcessedBlock = {
-  type: string;
-  content: string;
-  children?: ProcessedBlock[];
-};
-
-// Helper function to extract property value
-function extractPropertyValue(property: any): any {
-  switch (property.type) {
-    case "title":
-      return property.title[0]?.plain_text || null;
-    case "rich_text":
-      return property.rich_text[0]?.plain_text || null;
-    case "people":
-      return property.people.map((person: any) => ({
-        id: person.id,
-        name: person.name,
-        avatar_url: person.avatar_url,
-      }));
-    case "date":
-      return property.date?.start || null;
-    case "select":
-      return property.select?.name || null;
-    default:
-      return property[property.type];
-  }
-}
-
-// Extract content from rich text blocks
-function extractRichTextContent(richTexts: RichTextItemResponse[]): string {
-  return richTexts.map((text: RichTextItemResponse) => text.plain_text || '').join('').trim();
-}
-
-// Extract block content based on block type
-function extractBlockContent(block: BlockObjectResponse): string {
-  switch(block.type) {
-    case 'paragraph':
-      return extractRichTextContent(block.paragraph.rich_text);
-    case 'heading_1':
-      return extractRichTextContent(block.heading_1.rich_text);
-    case 'heading_2':
-      return extractRichTextContent(block.heading_2.rich_text);
-    case 'heading_3':
-      return extractRichTextContent(block.heading_3.rich_text);
-    case 'bulleted_list_item':
-      return extractRichTextContent(block.bulleted_list_item.rich_text);
-    case 'numbered_list_item':
-      return extractRichTextContent(block.numbered_list_item.rich_text);
-    case 'toggle':
-      return extractRichTextContent(block.toggle.rich_text);
-    default:
-      return '';
-  }
-}
-
-// Batch fetch and process blocks
-async function processBlocks(
-  pageId: string, 
-  maxDepth: number = 3
-): Promise<ProcessedBlock[]> {
-  const initialBlocksResponse = await notion.blocks.children.list({
-    block_id: pageId,
-    page_size: 100,
-  });
-
-  const processBlocksRecursive = async (
-    blocks: BlockObjectResponse[], 
-    currentDepth: number
-  ): Promise<ProcessedBlock[]> => {
-    const processedBlocks: ProcessedBlock[] = [];
-
-    for (const block of blocks) {
-      const content = extractBlockContent(block);
-
-      if (content && currentDepth > 0) {
-        const processedBlock: ProcessedBlock = { 
-          type: block.type, 
-          content 
-        };
-
-        if (block.has_children && currentDepth > 1) {
-          try {
-            const childBlocksResponse = await notion.blocks.children.list({
-              block_id: block.id,
-              page_size: 100
-            });
-
-            processedBlock.children = await processBlocksRecursive(
-              childBlocksResponse.results as BlockObjectResponse[], 
-              currentDepth - 1
-            );
-          } catch (error) {
-            console.error(`Error fetching children for block ${block.id}:`, error);
-          }
-        }
-
-        processedBlocks.push(processedBlock);
-      }
+    if (error || !user) {
+      console.error('Error finding user:', error);
+      return null;
     }
 
-    return processedBlocks;
-  };
-
-  return processBlocksRecursive(
-    initialBlocksResponse.results as BlockObjectResponse[], 
-    maxDepth
-  );
+    return user.id;
+  } catch (error) {
+    console.error('Error in getInternalUserId:', error);
+    return null;
+  }
 }
+
+// Cache expiration (1 day)
+const CACHE_EXPIRATION = 24 * 60 * 60; // seconds
 
 // Generate a cache key for a specific page
 function getPageCacheKey(pageId: string): string {
@@ -143,15 +46,15 @@ async function getCachedPage(pageId: string): Promise<any | null> {
 }
 
 // Cache a page
-async function cachePage(pageId: string, pageData: any): Promise<void> {
+async function cachePage(pageId: string, pageData: any, expiration: number = CACHE_EXPIRATION): Promise<void> {
   try {
     await redisClient.set(
       getPageCacheKey(pageId), 
       JSON.stringify(pageData), 
       'EX', 
-      CACHE_EXPIRATION
+      expiration
     );
-    console.log(`Cached page ${pageId} for 1 week`);
+    console.log(`Cached page ${pageId} for ${expiration} seconds`);
   } catch (error) {
     console.error('Redis cache setting error:', error);
   }
@@ -162,9 +65,31 @@ export async function GET(
   { params }: { params: { id: string } }
 ) {
   const startTime = Date.now();
+  
+  // Get authenticated user from Clerk
+  const { userId: clerkId } = await auth();
+  
+  if (!clerkId) {
+    return NextResponse.json(
+      { error: 'Unauthorized' }, 
+      { status: 401 }
+    );
+  }
+
+  // Convert Clerk ID to internal UUID
+  const internalUserId = await getInternalUserId(clerkId);
+  
+  if (!internalUserId) {
+    return NextResponse.json(
+      { error: 'User not found in database' }, 
+      { status: 404 }
+    );
+  }
 
   try {
     const pageId = params.id;
+    const syncFromNotion = request.nextUrl.searchParams.get('sync') === 'true';
+    const forceRefresh = request.nextUrl.searchParams.get('force_refresh') === 'true';
 
     if (!pageId) {
       return NextResponse.json(
@@ -173,50 +98,81 @@ export async function GET(
       );
     }
 
-    // First, check Redis cache
-    const cachedPage = await getCachedPage(pageId);
-    if (cachedPage) {
-      console.log(`🚀 Returning CACHED Notion page for ID: ${pageId}`);
-      console.log(`   Cached at: ${new Date().toISOString()}`);
-      console.log(`   Page Title: ${cachedPage['Pages '] || 'Untitled'}`);
-      return NextResponse.json(cachedPage);
-    } else {
-      console.log(`🌐 Fetching Notion page from API for ID: ${pageId}`);
+    // If sync is requested, pull from Notion first
+    if (syncFromNotion) {
+      console.log(`Syncing page ${pageId} from Notion for user ${internalUserId}`);
+      const syncSuccess = await syncNotionPageToSupabase(pageId, internalUserId);
+      
+      if (!syncSuccess) {
+        console.warn(`Sync failed for page ${pageId}`);
+      }
+      
+      // Clear cache after sync regardless of success to ensure we fetch latest data
+      await redisClient.del(getPageCacheKey(pageId));
+    }
+    
+    // Check cache if not forcing refresh
+    if (!forceRefresh && !syncFromNotion) {
+      const cachedPage = await getCachedPage(pageId);
+      if (cachedPage) {
+        console.log(`Returning CACHED page ${pageId} (${Date.now() - startTime}ms)`);
+        return NextResponse.json(cachedPage);
+      }
     }
 
-    // Fetch page from Notion if not in cache
-    const pageResponse = await notion.pages.retrieve({
-      page_id: pageId
-    }) as PageObjectResponse;
+    // Fetch from Supabase
+    console.log(`Fetching page ${pageId} from Supabase for user ${internalUserId}`);
+    const { data: page, error } = await supabase
+      .from('pages')
+      .select('*')
+      .eq('notion_page_id', pageId)
+      .eq('user_id', internalUserId)  // Using internal UUID here
+      .single();
 
-    // Extract properties dynamically
-    const properties: Record<string, any> = {};
-    Object.entries(pageResponse.properties).forEach(([key, prop]) => {
-      properties[key] = extractPropertyValue(prop);
-    });
+    if (error) {
+      console.error(`Error fetching page ${pageId}:`, error);
+      return NextResponse.json(
+        { error: 'Failed to fetch page', details: error.message },
+        { status: error.code === 'PGRST116' ? 404 : 500 }
+      );
+    }
 
-    // Process all blocks with batch fetching
-    const blockContents = await processBlocks(pageId);
+    if (!page) {
+      return NextResponse.json(
+        { error: 'Page not found' },
+        { status: 404 }
+      );
+    }
 
-    // Prepare full page data
+    // Transform the Supabase page to match the expected frontend format
     const pageData = {
-      id: pageResponse.id,
-      url: pageResponse.url,
-      ...properties,
-      blocks: blockContents
+      id: page.notion_page_id,
+      url: page.notion_url,
+      pageTitle: page.title,
+      Description: page.description,
+      author: page.author_name ? [{
+        id: page.author_id || '',
+        name: page.author_name,
+        avatar_url: page.author_avatar_url
+      }] : [],
+      Date: page.created_date ? new Date(page.created_date).toLocaleDateString() : '',
+      blocks: page.blocks || [],
+      // Include sync information
+      last_synced_at: page.last_synced_at,
+      notion_last_edited_at: page.notion_last_edited_at
     };
 
-    // Cache the page data for 1 week
+    // Cache the page with the default expiration
     await cachePage(pageId, pageData);
 
     const processingTime = Date.now() - startTime;
-    console.log(`Page processed in ${processingTime}ms`);
+    console.log(`Page ${pageId} processed in ${processingTime}ms`);
 
     return NextResponse.json(pageData);
   } catch (error) {
-    console.error('Error fetching Notion page:', error);
+    console.error('Error retrieving page:', error);
     return NextResponse.json(
-      { error: 'Failed to fetch Notion page', details: error },
+      { error: 'Failed to retrieve page', details: error instanceof Error ? error.message : String(error) },
       { status: 500 }
     );
   }
@@ -226,6 +182,26 @@ export async function DELETE(
   request: NextRequest,
   { params }: { params: { id: string } }
 ) {
+  // Get authenticated user from Clerk
+  const { userId: clerkId } = await auth();
+  
+  if (!clerkId) {
+    return NextResponse.json(
+      { error: 'Unauthorized' }, 
+      { status: 401 }
+    );
+  }
+
+  // Convert Clerk ID to internal UUID
+  const internalUserId = await getInternalUserId(clerkId);
+  
+  if (!internalUserId) {
+    return NextResponse.json(
+      { error: 'User not found in database' }, 
+      { status: 404 }
+    );
+  }
+
   try {
     const pageId = params.id;
 
@@ -236,15 +212,26 @@ export async function DELETE(
       );
     }
 
-    // Archive the page in Notion
-    await notion.pages.update({
-      page_id: pageId,
-      archived: true,
-    });
+    // Delete from Supabase
+    const { error } = await supabase
+      .from('pages')
+      .delete()
+      .eq('notion_page_id', pageId)
+      .eq('user_id', internalUserId);  // Using internal UUID here
+
+    if (error) {
+      console.error(`Error deleting page ${pageId}:`, error);
+      return NextResponse.json(
+        { error: 'Failed to delete page', details: error.message },
+        { status: 500 }
+      );
+    }
 
     // Remove the page from Redis cache
     try {
       await redisClient.del(getPageCacheKey(pageId));
+      // Also invalidate the pages list cache
+      await redisClient.del(`notion_pages:${internalUserId}`);
     } catch (cacheError) {
       console.error('Error removing page from Redis cache:', cacheError);
     }
@@ -254,9 +241,9 @@ export async function DELETE(
       { status: 200 }
     );
   } catch (error) {
-    console.error('Error deleting Notion page:', error);
+    console.error('Error deleting page:', error);
     return NextResponse.json(
-      { error: 'Failed to delete Notion page', details: error },
+      { error: 'Failed to delete page', details: error instanceof Error ? error.message : String(error) },
       { status: 500 }
     );
   }
