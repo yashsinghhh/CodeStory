@@ -15,6 +15,8 @@ interface NotionPageDetails {
     content: string;
     children?: Array<any>; // Add support for nested children
   }>;
+  last_synced_at?: string;
+  notion_last_edited_at?: string;
   [key: string]: any; // Allow additional dynamic properties
 }
 
@@ -304,9 +306,18 @@ function processBlockWithChildren(block: BlockObjectResponse, childrenMap: Map<s
   return processedBlock;
 }
 
-export default async function NotionPageDetail({ params }: { params: { id: string } }) {
+export default async function NotionPageDetail({ 
+  params,
+  searchParams 
+}: { 
+  params: { id: string },
+  searchParams: { [key: string]: string | string[] | undefined }
+}) {
+  // Check if sync was requested via URL parameter
+  const shouldSync = searchParams?.sync === 'true';
+  
   // Validate params
-  const pageId = await params.id;
+  const pageId = params.id;
 
   if (!pageId) {
     return (
@@ -356,6 +367,18 @@ export default async function NotionPageDetail({ params }: { params: { id: strin
 
       {/* Main Content */}
       <main className="container mx-auto px-4 py-24 max-w-3xl">
+        {/* Sync info banner if page was just synced */}
+        {shouldSync && (
+          <div className="mb-6 p-4 bg-green-50 border border-green-200 rounded-lg text-green-700 animate-fade-in-up">
+            <div className="flex items-center">
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+              </svg>
+              <p>This page has been synced from Notion</p>
+            </div>
+          </div>
+        )}
+        
         {/* Page Header */}
         <header className="mb-12 animate-fade-in-up">
           {/* Author Info */}
@@ -399,32 +422,14 @@ export default async function NotionPageDetail({ params }: { params: { id: strin
           <NotionBlockRenderer blocks={pageDetails.blocks} />
         </article>
 
-        {/* Page Actions */}
-        <PageActions pageId={pageDetails.id} notionUrl={pageDetails.url} />
+        {/* Page Actions - passing sync information */}
+        <PageActions 
+          pageId={pageDetails.id} 
+          notionUrl={pageDetails.url}
+          lastSyncedAt={pageDetails.last_synced_at}
+          notionLastEditedAt={pageDetails.notion_last_edited_at}
+        />
       </main>
     </div>
   );
-}
-
-// Generate static params for better performance
-export async function generateStaticParams() {
-  try {
-    // Fetch all pages from the API route
-    const response = await fetch(
-      new URL('/api/notion', process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000').toString()
-    );
-    
-    if (!response.ok) {
-      throw new Error(`Failed to fetch pages: ${response.status}`);
-    }
-    
-    const pages = await response.json();
-    
-    return pages.map((page: any) => ({
-      id: page.id,
-    }));
-  } catch (error) {
-    console.error("Error generating static params:", error);
-    return [];
-  }
 }

@@ -6,9 +6,16 @@ import { useRouter } from 'next/navigation';
 interface PageActionsProps {
   pageId: string;
   notionUrl: string;
+  lastSyncedAt?: string;
+  notionLastEditedAt?: string;
 }
 
-export default function PageActions({ pageId, notionUrl }: PageActionsProps) {
+export default function PageActions({ 
+  pageId, 
+  notionUrl, 
+  lastSyncedAt, 
+  notionLastEditedAt 
+}: PageActionsProps) {
   const router = useRouter();
   const [isDeleting, setIsDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);

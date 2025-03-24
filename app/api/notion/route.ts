@@ -1,178 +1,38 @@
 // app/api/notion/route.ts
-import { Client } from '@notionhq/client';
 import { NextRequest, NextResponse } from 'next/server';
+import { supabase } from '@/lib/supabase';
 import redisClient from '@/lib/redis';
-import { 
-  BlockObjectResponse, 
-  PartialBlockObjectResponse,
-  RichTextItemResponse
-} from '@notionhq/client/build/src/api-endpoints';
+import { auth } from '@clerk/nextjs/server';
+import { syncAllNotionPagesToSupabase } from '@/lib/notion-sync';
 
-// Initialize Notion client
-const notion = new Client({
-  auth: process.env.NOTION_API_KEY
-});
+// Helper to get internal UUID from Clerk ID
+async function getInternalUserId(clerkId: string): Promise<string | null> {
+  try {
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('id')
+      .eq('clerk_id', clerkId)
+      .single();
+
+    if (error || !user) {
+      console.error('Error finding user:', error);
+      return null;
+    }
+
+    return user.id;
+  } catch (error) {
+    console.error('Error in getInternalUserId:', error);
+    return null;
+  }
+}
 
 // Cache expiration (1 hour)
 const CACHE_EXPIRATION = 3600; // seconds
 
-// Helper function to extract page title
-function extractPageTitle(properties: Record<string, any>): string | null {
-  // Try multiple property types that could represent the page title
-  const possibleTitleKeys = ['Pages', 'Pages ', 'Name', 'Title'];
-  
-  for (const key of possibleTitleKeys) {
-    const prop = properties[key];
-    
-    if (!prop) continue;
-
-    // Handle different property types
-    switch (prop.type) {
-      case 'title':
-        return prop.title[0]?.plain_text || null;
-      case 'rich_text':
-        return prop.rich_text[0]?.plain_text || null;
-      case 'select':
-        return prop.select?.name || null;
-      case 'multi_select':
-        return prop.multi_select?.[0]?.name || null;
-      default:
-        // If it's a direct string or value
-        if (typeof prop === 'string') return prop;
-    }
-  }
-
-  return null;
-}
-
-// Helper to safely access rich text content from blocks
-function getRichTextContent(richTextArray: RichTextItemResponse[] | undefined): string {
-  if (!richTextArray || !Array.isArray(richTextArray)) return '';
-  return richTextArray.map(text => text.plain_text || '').join('');
-}
-
-// Helper function to extract text from toggle blocks
-async function extractToggleContent(block: BlockObjectResponse): Promise<any> {
-  // Type check to ensure we're dealing with a toggle block
-  if (block.type !== 'toggle' || !('toggle' in block)) {
-    return null;
-  }
-  
-  // Get the toggle header text
-  const headerText = getRichTextContent(block.toggle.rich_text);
-  
-  // Initialize children array
-  const children = [];
-  
-  // Fetch child blocks if they exist
-  if (block.has_children) {
-    try {
-      const childBlocksResponse = await notion.blocks.children.list({
-        block_id: block.id,
-        page_size: 100
-      });
-      
-      // Process each child block
-      for (const childBlock of childBlocksResponse.results as BlockObjectResponse[]) {
-        let childContent = await extractBlockContent(childBlock);
-        
-        if (childContent && (typeof childContent === 'object' ? 
-            (childContent.content && childContent.content.trim() !== '') : 
-            childContent.trim() !== '')) {
-          children.push(childContent);
-        }
-      }
-    } catch (error) {
-      console.error(`Error fetching toggle children for block ${block.id}:`, error);
-    }
-  }
-  
-  // Return structured toggle data
-  return {
-    type: 'toggle',
-    content: headerText,
-    children: children
-  };
-}
-
-// Helper function to extract content from different block types
-async function extractBlockContent(block: BlockObjectResponse | PartialBlockObjectResponse): Promise<any> {
-  // Handle partial blocks
-  if (!('type' in block)) {
-    return null;
-  }
-  
-  switch(block.type) {
-    case "paragraph":
-      if ('paragraph' in block) {
-        const content = getRichTextContent(block.paragraph.rich_text);
-        return content ? { type: "paragraph", content } : null;
-      }
-      break;
-    case "heading_1":
-      if ('heading_1' in block) {
-        const content = getRichTextContent(block.heading_1.rich_text);
-        return content ? { type: "heading_1", content } : null;
-      }
-      break;
-    case "heading_2":
-      if ('heading_2' in block) {
-        const content = getRichTextContent(block.heading_2.rich_text);
-        return content ? { type: "heading_2", content } : null;
-      }
-      break;
-    case "heading_3":
-      if ('heading_3' in block) {
-        const content = getRichTextContent(block.heading_3.rich_text);
-        return content ? { type: "heading_3", content } : null;
-      }
-      break;
-    case "bulleted_list_item":
-      if ('bulleted_list_item' in block) {
-        const content = getRichTextContent(block.bulleted_list_item.rich_text);
-        
-        // Check for children
-        if (block.has_children) {
-          const childBlocksResponse = await notion.blocks.children.list({
-            block_id: block.id,
-            page_size: 100
-          });
-          
-          const childContents = [];
-          for (const childBlock of childBlocksResponse.results as BlockObjectResponse[]) {
-            const childContent = await extractBlockContent(childBlock);
-            if (childContent) childContents.push(childContent);
-          }
-          
-          return {
-            type: "bulleted_list_item", 
-            content,
-            children: childContents.length > 0 ? childContents : undefined
-          };
-        }
-        
-        return content ? { type: "bulleted_list_item", content } : null;
-      }
-      break;
-    case "toggle":
-      if ('toggle' in block) {
-        return await extractToggleContent(block as BlockObjectResponse);
-      }
-      break;
-    default:
-      return {
-        type: block.type,
-        content: 'Unsupported block type: ' + block.type
-      };
-  }
-  
-  return null;
-}
-
 // Redis caching helpers
-async function getCachedNotionPages(): Promise<any[] | null> {
+async function getCachedNotionPages(userId: string): Promise<any[] | null> {
   try {
-    const cachedData = await redisClient.get('notion_pages');
+    const cachedData = await redisClient.get(`notion_pages:${userId}`);
     return cachedData ? JSON.parse(cachedData) : null;
   } catch (error) {
     console.error('Redis cache retrieval error:', error);
@@ -180,100 +40,104 @@ async function getCachedNotionPages(): Promise<any[] | null> {
   }
 }
 
-async function cacheNotionPages(pages: any[]): Promise<void> {
+async function cacheNotionPages(userId: string, pages: any[]): Promise<void> {
   try {
-    await redisClient.set('notion_pages', JSON.stringify(pages), 'EX', CACHE_EXPIRATION);
-    console.log(`Cached ${pages.length} Notion pages`);
+    await redisClient.set(`notion_pages:${userId}`, JSON.stringify(pages), 'EX', CACHE_EXPIRATION);
+    console.log(`Cached ${pages.length} Notion pages for user ${userId}`);
   } catch (error) {
     console.error('Redis cache setting error:', error);
   }
 }
 
 export async function GET(request: NextRequest) {
+  // Get authenticated user from Clerk
+  const { userId: clerkId } = await auth();
+  
+  if (!clerkId) {
+    return NextResponse.json(
+      { error: 'Unauthorized' }, 
+      { status: 401 }
+    );
+  }
+
+  // Convert Clerk ID to internal UUID
+  const internalUserId = await getInternalUserId(clerkId);
+  
+  if (!internalUserId) {
+    return NextResponse.json(
+      { error: 'User not found in database' }, 
+      { status: 404 }
+    );
+  }
+
   // Check if cache should be force updated
   const forceUpdate = request.nextUrl.searchParams.get('force_update') === 'true';
+  const syncFromNotion = request.nextUrl.searchParams.get('sync') === 'true';
 
   try {
+    // If sync is requested, pull from Notion to Supabase first
+    if (syncFromNotion) {
+      console.log(`Syncing Notion pages for user ${internalUserId}`);
+      const syncSuccess = await syncAllNotionPagesToSupabase(internalUserId);
+      if (!syncSuccess) {
+        console.warn(`Sync failed or partially succeeded for user ${internalUserId}`);
+      }
+      
+      // Clear cache to ensure fresh data
+      await redisClient.del(`notion_pages:${internalUserId}`);
+      console.log(`Cleared cache for user ${internalUserId} after sync`);
+    }
     // If not forcing update, check Redis first
-    if (!forceUpdate) {
-      const cachedPages = await getCachedNotionPages();
+    else if (!forceUpdate) {
+      const cachedPages = await getCachedNotionPages(internalUserId);
       if (cachedPages) {
-        console.log('Returning cached Notion pages');
+        console.log(`Returning ${cachedPages.length} cached Notion pages for user ${internalUserId}`);
         return NextResponse.json(cachedPages);
       }
     }
 
-    // Replace with your actual Notion database ID
-    const databaseId = process.env.NOTION_DATABASE_ID;
+    // Fetch from Supabase
+    console.log(`Fetching pages from Supabase for user ${internalUserId}`);
+    const { data: pages, error } = await supabase
+      .from('pages')
+      .select('*')
+      .eq('user_id', internalUserId)  // Using internal UUID here
+      .order('created_at', { ascending: false });
 
-    if (!databaseId) {
+    if (error) {
+      console.error('Error fetching pages from Supabase:', error);
       return NextResponse.json(
-        { error: 'Notion Database ID is not configured' }, 
-        { status: 400 }
+        { error: 'Failed to fetch pages', details: error.message }, 
+        { status: 500 }
       );
     }
 
-    // Fetch database entries
-    const response = await notion.databases.query({
-      database_id: databaseId,
-    });
+    // Transform data to match the expected format for the frontend
+    const transformedResults = pages.map(page => ({
+      id: page.notion_page_id,
+      url: page.notion_url,
+      pageTitle: page.title,
+      Description: page.description,
+      author: page.author_name ? [{
+        id: page.author_id || '',
+        name: page.author_name,
+        avatar_url: page.author_avatar_url
+      }] : [],
+      Date: page.created_date ? new Date(page.created_date).toLocaleDateString() : '',
+      totalUsers: 0, // Legacy field, kept for compatibility
+      // Include sync information
+      last_synced_at: page.last_synced_at,
+      notion_last_edited_at: page.notion_last_edited_at
+    }));
 
-    // Transform Notion response to metadata-only JSON format
-    const transformedResults = response.results.map((page: any) => {
-      // Extract properties
-      const properties: Record<string, any> = {};
-
-      Object.entries(page.properties).forEach(([key, prop]: [string, any]) => {
-        switch(prop.type) {
-          case 'title':
-            properties[key] = prop.title[0]?.plain_text || null;
-            break;
-          case 'rich_text':
-            properties[key] = prop.rich_text[0]?.plain_text || null;
-            break;
-          case 'number':
-            properties[key] = prop.number;
-            break;
-          case 'select':
-            properties[key] = prop.select?.name || null;
-            break;
-          case 'multi_select':
-            properties[key] = prop.multi_select.map((item: any) => item.name);
-            break;
-          case 'date':
-            properties[key] = prop.date?.start || null;
-            break;
-          case 'people':
-            properties[key] = prop.people.map((person: any) => ({
-              id: person.id,
-              name: person.name,
-              avatar_url: person.avatar_url
-            }));
-            break;
-          default:
-            properties[key] = prop[prop.type];
-        }
-      });
-
-      // Extract page title
-      const pageTitle = extractPageTitle(properties);
-
-      return {
-        id: page.id,
-        url: page.url,
-        pageTitle, // Use the extracted page title
-        ...properties
-      };
-    });
-
-    // Always update the cache
-    await cacheNotionPages(transformedResults);
+    // Cache the transformed results
+    await cacheNotionPages(internalUserId, transformedResults);
 
     return NextResponse.json(transformedResults);
   } catch (error) {
-    console.error('Error fetching Notion database:', error);
+    console.error('Error retrieving Notion pages:', error);
     return NextResponse.json(
-      { error: 'Failed to fetch Notion database', details: error }, 
+      { error: 'Failed to retrieve pages', details: error instanceof Error ? error.message : String(error) }, 
       { status: 500 }
     );
   }

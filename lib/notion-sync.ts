@@ -1,8 +1,7 @@
 // lib/notion-sync.ts
 import { Client } from '@notionhq/client';
-// Change this line in lib/notion-sync.ts
-// import { supabase } from '@/lib/supabase';
 import { supabase } from './supabase';
+import { cacheUtils } from './redis';
 import { 
   BlockObjectResponse, 
   PageObjectResponse,
@@ -223,6 +222,8 @@ export async function syncNotionPageToSupabase(pageId: string, userId: string): 
       .eq('notion_page_id', pageId)
       .single();
     
+    let success = false;
+    
     if (existingPage) {
       // Update existing page
       console.log(`Updating existing page ${pageId} in Supabase`);
@@ -232,6 +233,7 @@ export async function syncNotionPageToSupabase(pageId: string, userId: string): 
         .eq('notion_page_id', pageId);
         
       if (error) throw error;
+      success = true;
     } else {
       // Insert new page
       console.log(`Creating new page ${pageId} in Supabase`);
@@ -240,10 +242,16 @@ export async function syncNotionPageToSupabase(pageId: string, userId: string): 
         .insert(pageData);
         
       if (error) throw error;
+      success = true;
     }
     
-    console.log(`Successfully synced page ${pageId} to Supabase`);
-    return true;
+    if (success) {
+      // Invalidate relevant caches
+      await cacheUtils.invalidatePageCache(pageId, userId);
+      console.log(`Successfully synced page ${pageId} to Supabase and invalidated cache`);
+    }
+    
+    return success;
   } catch (error) {
     console.error(`Error syncing page ${pageId}:`, error);
     return false;
@@ -277,7 +285,10 @@ export async function syncAllNotionPagesToSupabase(userId: string): Promise<bool
     const results = await Promise.all(syncPromises);
     const successCount = results.filter(Boolean).length;
     
-    console.log(`Successfully synced ${successCount} out of ${response.results.length} pages`);
+    // Invalidate user's page list cache after bulk sync
+    await cacheUtils.invalidateUserCache(userId);
+    
+    console.log(`Successfully synced ${successCount} out of ${response.results.length} pages and invalidated caches`);
     return successCount > 0;
   } catch (error) {
     console.error('Error syncing all Notion pages:', error);
