@@ -5,7 +5,7 @@ import { getInternalUserId } from '@/lib/user-utils';
 import { supabase } from '@/lib/supabase';
 import redisClient from '@/lib/redis';
 
-// Function to convert blocks to plain text
+// Function to convert blocks to plain text (as a fallback if not stored in DB)
 function blocksToPlainText(
   blocks: Array<any>, 
   indentLevel: number = 0, 
@@ -150,9 +150,6 @@ function assembleDocument(pageData: any): string {
   
   let document = '';
   
-  // Debug information about available fields
-  console.log('Available page data fields:', Object.keys(pageData));
-  
   // Try multiple possible title fields
   const possibleTitleFields = ['pageTitle', 'Pages', 'Pages ', 'Name', 'Title', 'title'];
   let foundTitle = false;
@@ -160,7 +157,6 @@ function assembleDocument(pageData: any): string {
   for (const field of possibleTitleFields) {
     if (pageData[field] && typeof pageData[field] === 'string') {
       document += `# ${pageData[field]}\n\n`;
-      console.log(`Found title in field: ${field}`);
       foundTitle = true;
       break;
     }
@@ -169,7 +165,6 @@ function assembleDocument(pageData: any): string {
   // If no title was found, add a default one
   if (!foundTitle) {
     document += `# Notion Document\n\n`;
-    console.log('No title found, using default');
   }
   
   // Try multiple possible description fields
@@ -179,7 +174,6 @@ function assembleDocument(pageData: any): string {
   for (const field of possibleDescFields) {
     if (pageData[field] && typeof pageData[field] === 'string') {
       document += `${pageData[field]}\n\n`;
-      console.log(`Found description in field: ${field}`);
       foundDesc = true;
       break;
     }
@@ -243,17 +237,42 @@ export async function GET(
       );
     }
 
-    // Fetch the page data (similar to your existing endpoint)
-    console.log(`Fetching page ${pageId} for plain text conversion`);
-    
     // First check Redis cache
     const cacheKey = `notion_page_detail:${pageId}`;
     const cachedPage = await redisClient.get(cacheKey);
     let pageData;
+    let plainTextContent: string;
     
     if (cachedPage) {
       console.log(`Using cached page data for ${pageId}`);
       pageData = JSON.parse(cachedPage);
+      
+      // Check if the cached page data already has plain text
+      if (pageData.plain_text) {
+        console.log(`Using cached plain text for ${pageId}`);
+        plainTextContent = pageData.plain_text;
+      } else {
+        // Fetch plain text from database if not in cache
+        console.log(`Plain text not in cache, checking database for ${pageId}`);
+        const { data: dbPage, error } = await supabase
+          .from('pages')
+          .select('plain_text')
+          .eq('notion_page_id', pageId)
+          .eq('user_id', internalUserId)
+          .single();
+          
+        if (!error && dbPage && dbPage.plain_text) {
+          console.log(`Using stored plain text from database for ${pageId}`);
+          plainTextContent = dbPage.plain_text;
+          
+          // Update the cache with plain text
+          pageData.plain_text = plainTextContent;
+          await redisClient.set(cacheKey, JSON.stringify(pageData), 'EX', 86400); // 24 hours
+        } else {
+          console.log(`Generating plain text on-the-fly for ${pageId}`);
+          plainTextContent = assembleDocument(pageData);
+        }
+      }
     } else {
       // Fetch from Supabase if not in cache
       console.log(`Fetching page ${pageId} from Supabase`);
@@ -280,19 +299,6 @@ export async function GET(
       }
       
       // Transform the page data to match your expected format
-      // Log the raw page data to see what fields are available
-      console.log('Raw page data from Supabase:', 
-        JSON.stringify({
-          id: page.notion_page_id,
-          url: page.notion_url,
-          title: page.title,
-          properties: page.properties || {},
-          description: page.description,
-          blocks: Array.isArray(page.blocks) ? `${page.blocks.length} blocks` : typeof page.blocks
-        }, null, 2)
-      );
-      
-      // Transform the page data to match your expected format
       pageData = {
         id: page.notion_page_id,
         url: page.notion_url,
@@ -316,16 +322,34 @@ export async function GET(
         created_date: page.created_date,
         // Blocks and other metadata
         blocks: page.blocks || [],
+        plain_text: page.plain_text, // Get the stored plain text
         last_synced_at: page.last_synced_at,
         notion_last_edited_at: page.notion_last_edited_at,
         // If there are any properties field, include those too
         ...(page.properties || {})
       };
+      
+      // Use stored plain text if available, otherwise generate it
+      if (page.plain_text) {
+        console.log(`Using stored plain text from database for ${pageId}`);
+        plainTextContent = page.plain_text;
+      } else {
+        console.log(`Generating plain text on-the-fly for ${pageId}`);
+        plainTextContent = assembleDocument(pageData);
+        
+        // Store generated plain text in database for future use
+        try {
+          await supabase
+            .from('pages')
+            .update({ plain_text: plainTextContent })
+            .eq('notion_page_id', pageId);
+          console.log(`Stored generated plain text in database for ${pageId}`);
+        } catch (updateError) {
+          console.error(`Failed to store plain text in database: ${updateError}`);
+        }
+      }
     }
 
-    // Convert blocks to plain text
-    const plainTextContent = assembleDocument(pageData);
-    
     // Return JSON response with both the original page data and plain text
     return NextResponse.json({
       pageId: pageId,
