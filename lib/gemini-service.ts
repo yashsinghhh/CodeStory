@@ -5,7 +5,7 @@ import { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } from '@google/ge
 const googleAI = new GoogleGenerativeAI(process.env.GOOGLE_AI_API_KEY || '');
 
 // Default model to use
-const DEFAULT_MODEL = 'gemini-1.5-pro';
+const DEFAULT_MODEL = 'gemini-2.0-flash';
 
 interface GeminiRequestOptions {
   temperature?: number;

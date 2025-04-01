@@ -4,6 +4,7 @@ import Link from "next/link";
 import { PageObjectResponse, BlockObjectResponse } from "@notionhq/client/build/src/api-endpoints";
 import PageActions from './page-actions';
 import NotionBlockRenderer from "../../components/NotionBlockRenderer";
+import GeminiAnalyzeButton from "../../components/GeminiAnalyzeButton";
 import redisClient from '@/lib/redis';
 
 // Define a more flexible interface for page details
@@ -422,13 +423,17 @@ export default async function NotionPageDetail({
           <NotionBlockRenderer blocks={pageDetails.blocks} />
         </article>
 
-        {/* Page Actions - passing sync information */}
-        <PageActions 
-          pageId={pageDetails.id} 
-          notionUrl={pageDetails.url}
-          lastSyncedAt={pageDetails.last_synced_at}
-          notionLastEditedAt={pageDetails.notion_last_edited_at}
-        />
+        {/* Page Actions with Gemini Button */}
+        <div className="mt-12 flex flex-col items-center space-y-6 animate-fade-in-up delay-500">
+          <GeminiAnalyzeButton pageId={pageDetails.id} />
+          
+          <PageActions 
+            pageId={pageDetails.id} 
+            notionUrl={pageDetails.url}
+            lastSyncedAt={pageDetails.last_synced_at}
+            notionLastEditedAt={pageDetails.notion_last_edited_at}
+          />
+        </div>
       </main>
     </div>
   );
