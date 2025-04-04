@@ -4,6 +4,7 @@ import { auth } from '@clerk/nextjs/server';
 import { getInternalUserId } from '@/lib/user-utils';
 import { supabase } from '@/lib/supabase';
 import { processWithGemini, createDefaultSystemPrompt } from '@/lib/gemini-service';
+import redisClient from '@/lib/redis';
 
 export async function POST(request: NextRequest) {
   // Get authenticated user
@@ -40,7 +41,7 @@ export async function POST(request: NextRequest) {
     // Get the page from Supabase
     const { data: page, error } = await supabase
       .from('pages')
-      .select('title, plain_text')
+      .select('title, plain_text, gemini_analysis, gemini_analyzed_at')
       .eq('notion_page_id', pageId)
       .eq('user_id', internalUserId)
       .single();
@@ -66,6 +67,19 @@ export async function POST(request: NextRequest) {
       );
     }
     
+    // If we have a stored analysis and the client didn't request a refresh, return it
+    const forceRefresh = body.forceRefresh === true;
+    if (page.gemini_analysis && !forceRefresh) {
+      console.log(`Using cached Gemini analysis for page ${pageId}`);
+      return NextResponse.json({
+        success: true,
+        pageTitle: page.title,
+        result: page.gemini_analysis,
+        analyzedAt: page.gemini_analyzed_at,
+        cached: true
+      });
+    }
+    
     console.log(`Analyzing page "${page.title}" with Gemini...`);
     console.log(`Content length: ${page.plain_text.length} characters`);
     
@@ -85,6 +99,33 @@ Please provide:
     // Process with Gemini
     const result = await processWithGemini(page.plain_text, systemPrompt);
     
+    // Store the result in Supabase
+    const now = new Date().toISOString();
+    const { error: updateError } = await supabase
+      .from('pages')
+      .update({
+        gemini_analysis: result,
+        gemini_analyzed_at: now,
+        updated_at: now
+      })
+      .eq('notion_page_id', pageId)
+      .eq('user_id', internalUserId);
+      
+    if (updateError) {
+      console.error(`Error storing Gemini analysis: ${updateError.message}`);
+    } else {
+      console.log(`Successfully stored Gemini analysis for page ${pageId}`);
+      
+      // Invalidate any cached version of this page
+      try {
+        const cacheKey = `notion_page_detail:${pageId}`;
+        await redisClient.del(cacheKey);
+        console.log(`Invalidated cache for page ${pageId}`);
+      } catch (cacheError) {
+        console.error('Error clearing page cache:', cacheError);
+      }
+    }
+    
     // Log the result to terminal
     console.log("\n=== GEMINI ANALYSIS ===");
     console.log(`Page: ${page.title}`);
@@ -95,7 +136,9 @@ Please provide:
     return NextResponse.json({
       success: true,
       pageTitle: page.title,
-      result: result
+      result: result,
+      analyzedAt: now,
+      cached: false
     });
     
   } catch (error) {

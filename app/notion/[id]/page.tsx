@@ -5,6 +5,7 @@ import { PageObjectResponse, BlockObjectResponse } from "@notionhq/client/build/
 import PageActions from './page-actions';
 import NotionBlockRenderer from "../../components/NotionBlockRenderer";
 import GeminiAnalyzeButton from "../../components/GeminiAnalyzeButton";
+import GeminiAnalysisDisplay from "../../components/GeminiAnalysisDisplay";
 import redisClient from '@/lib/redis';
 
 // Define a more flexible interface for page details
@@ -18,6 +19,8 @@ interface NotionPageDetails {
   }>;
   last_synced_at?: string;
   notion_last_edited_at?: string;
+  gemini_analysis?: string;
+  gemini_analyzed_at?: string;
   [key: string]: any; // Allow additional dynamic properties
 }
 
@@ -423,9 +426,24 @@ export default async function NotionPageDetail({
           <NotionBlockRenderer blocks={pageDetails.blocks} />
         </article>
 
+        {/* Gemini Analysis Display */}
+        {pageDetails.gemini_analysis && (
+          <div className="mt-12 animate-fade-in-up delay-300">
+            <GeminiAnalysisDisplay 
+              pageId={pageDetails.id}
+              initialAnalysis={{
+                result: pageDetails.gemini_analysis,
+                analyzedAt: pageDetails.gemini_analyzed_at || ''
+              }}
+            />
+          </div>
+        )}
+
         {/* Page Actions with Gemini Button */}
         <div className="mt-12 flex flex-col items-center space-y-6 animate-fade-in-up delay-500">
-          <GeminiAnalyzeButton pageId={pageDetails.id} />
+          {!pageDetails.gemini_analysis && (
+            <GeminiAnalyzeButton pageId={pageDetails.id} />
+          )}
           
           <PageActions 
             pageId={pageDetails.id} 
