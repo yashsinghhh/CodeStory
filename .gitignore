@@ -44,3 +44,11 @@ next-env.d.ts
 # Supabase
 **/supabase/.temp/
 **/supabase/.branches/
+
+
+# Audio generation output
+/public/audio/*.wav
+/public/audio/**/*.wav
+
+# Prevent committing any audio files in the audio directory
+*.wav
